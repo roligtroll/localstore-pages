@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pick items</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root { color-scheme: light dark; --bg: #ffffff; --fg: #000000; --accent: #0a58ca; --on-accent: #ffffff; --err: #b00020; --panel: #eeeeee; --field: #ffffff; --edge: #767676; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #000000; --fg: #ffffff; --accent: #4da3ff; --on-accent: #000000; --err: #ff8a80; --panel: #1c1c1e; --field: #1c1c1e; --edge: #8e8e93; } }
+  :root[data-theme="dark"] { --bg: #000000; --fg: #ffffff; --accent: #4da3ff; --on-accent: #000000; --err: #ff8a80; --panel: #1c1c1e; --field: #1c1c1e; --edge: #8e8e93; }
+  *, *::before, *::after { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; padding: 16px; min-height: 100vh; background: var(--bg); color: var(--fg); font: 16px/1.4 -apple-system, system-ui, sans-serif; }
+  h1 { font-size: 22px; margin: 0 0 8px; overflow-wrap: anywhere; }
+  p { margin: 8px 0; overflow-wrap: anywhere; }
+  input { display: block; width: 100%; min-height: 44px; padding: 10px 12px; font: inherit; font-size: 16px; color: var(--fg); background: var(--field); border: 1px solid var(--edge); border-radius: 10px; text-align: center; }
+  button { display: block; width: 100%; min-height: 44px; margin: 8px 0; font: inherit; font-size: 17px; border: 0; border-radius: 10px; background: var(--accent); color: var(--on-accent); }
+  button:disabled { opacity: 0.5; }
+  button.secondary { background: var(--panel); color: var(--fg); }
+  button:focus-visible, input:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .item { border-bottom: 1px solid var(--edge); padding: 8px 0; }
+  .item-name { font-weight: 600; overflow-wrap: anywhere; margin: 8px 0 0; }
+  .item-price { margin: 4px 0 8px; }
+  .stepper { display: flex; gap: 8px; align-items: center; }
+  .stepper button { width: 44px; min-width: 44px; margin: 0; font-size: 22px; }
+  .stepper input { flex: 1; min-width: 0; }
+  .err { color: var(--err); font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <section id="error" role="alert" hidden>
+    <p id="errorText" class="err"></p>
+    <button id="btnCloseError" type="button">Close</button>
+  </section>
+
+  <section id="page" hidden>
+    <h1 id="title"></h1>
+    <form id="form" novalidate autocomplete="off">
+      <div id="items"></div>
+      <button id="btnSubmit" type="submit">Send</button>
+      <p id="formError" class="err" role="alert"></p>
+    </form>
+  </section>
+</main>
+<script>
+'use strict';
+
+// Pick-items page 1.0. The host opens it from a reply-keyboard button with
+// #d=<base64url(JSON)>, and the page answers once with sendData.
+// Pure functions below never touch document or Telegram; the DOM wiring at the
+// end runs only in a browser. The rules mirror src/pages/pick-items.ts: the host
+// refuses any answer these rules would refuse, and pick-items.test.ts checks both.
+
+var MAX_REF = 64;
+var MAX_ANSWER_BYTES = 4096;
+var DEFAULT_TITLE = 'Choose items';
+var FRAGMENT_ERROR = 'This link is not valid. Go back to the chat and open it again.';
+var PICK_ITEMS_PAGE = 'pick-items';
+var SPEC_KEYS = ['title', 'currency', 'items', 'decimals'];
+var ITEM_KEYS = ['id', 'name', 'price', 'max'];
+var OK = { ok: true };
+
+// base64url (RFC 4648 section 5, no padding) -> bytes.
+function base64urlToBytes(s) {
+  var b = s.replace(/-/g, '+').replace(/_/g, '/');
+  while (b.length % 4) b += '=';
+  return Uint8Array.from(atob(b), function (c) { return c.charCodeAt(0); });
+}
+
+// Telegram appends tgWebAppData, tgWebAppVersion and the like in any order, so
+// d is found by its name. The error is a fixed message: it never echoes input.
+function parseFragment(hash) {
+  var raw = typeof hash === 'string' ? hash : '';
+  if (raw.charAt(0) === '#') raw = raw.slice(1);
+  var parts = raw.split('&');
+  var d = null;
+  for (var i = 0; i < parts.length; i += 1) {
+    var eq = parts[i].indexOf('=');
+    if (eq >= 0 && parts[i].slice(0, eq) === 'd') { d = parts[i].slice(eq + 1); break; }
+  }
+  if (d === null || !/^[A-Za-z0-9_-]+$/.test(d)) return { ok: false, error: 'invalid fragment' };
+  var data;
+  try {
+    data = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(base64urlToBytes(d)));
+  } catch (e) {
+    return { ok: false, error: 'invalid fragment' };
+  }
+  if (!data || typeof data !== 'object' || data.v !== 1) return { ok: false, error: 'invalid fragment' };
+  if (typeof data.r !== 'string' || data.r.length < 1 || data.r.length > MAX_REF) {
+    return { ok: false, error: 'invalid fragment' };
+  }
+  return { ok: true, data: data };
+}
+
+// The spec is the fragment without v and r. A null-prototype copy keeps a key
+// named __proto__ as an ordinary key, so the validator sees it and refuses it.
+function specFromFragment(data) {
+  var spec = Object.create(null);
+  Object.keys(data).forEach(function (key) {
+    if (key !== 'v' && key !== 'r') spec[key] = data[key];
+  });
+  return spec;
+}
+
+// Returns once(fn): the first call runs fn and returns true; later calls return false.
+// once.release() lets the next call run again, after an attempt that sent nothing.
+function createSendOnce() {
+  var sent = false;
+  function once(fn) {
+    if (sent) return false;
+    sent = true;
+    fn();
+    return true;
+  }
+  once.release = function () { sent = false; };
+  return once;
+}
+
+// The labels a customer's screen reader hears for one item's controls.
+function quantityLabels(name) {
+  return {
+    input: name + ', quantity',
+    less: name + ', one less',
+    more: name + ', one more'
+  };
+}
+
+function answerBytes(answer) {
+  return new TextEncoder().encode(JSON.stringify(answer)).length;
+}
+
+function isObject(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function onlyKeys(obj, allowed) {
+  return Object.keys(obj).every(function (key) { return allowed.indexOf(key) >= 0; });
+}
+
+// Text of min to max characters, counted by code point.
+function textWithin(value, min, max) {
+  if (typeof value !== 'string') return false;
+  var length = Array.from(value).length;
+  return length >= min && length <= max;
+}
+
+function isInt(value) {
+  return typeof value === 'number' && Number.isSafeInteger(value);
+}
+
+function refuse(error) {
+  return { ok: false, error: error };
+}
+
+// Checks the spec, as src/pages/pick-items.ts validatePickItemsSpec does.
+function validatePickItemsSpec(spec) {
+  if (!isObject(spec) || !onlyKeys(spec, SPEC_KEYS)) return refuse('spec is not an object with known keys');
+  var title = spec.title;
+  var currency = spec.currency;
+  var items = spec.items;
+  if (title !== undefined && !textWithin(title, 1, 60)) return refuse('title must be 1 to 60 characters');
+  if (!textWithin(currency, 1, 8)) return refuse('currency must be 1 to 8 characters');
+  var decimals = spec.decimals;
+  if (decimals !== undefined && (!isInt(decimals) || decimals < 0 || decimals > 3)) {
+    return refuse('decimals must be a whole number from 0 to 3');
+  }
+  if (!Array.isArray(items) || items.length < 1 || items.length > 60) return refuse('items must hold 1 to 60 items');
+  var seen = [];
+  for (var i = 0; i < items.length; i += 1) {
+    var check = validateItem(items[i]);
+    if (!check.ok) return check;
+    if (seen.indexOf(items[i].id) >= 0) return refuse('item ids must be unique');
+    seen.push(items[i].id);
+  }
+  return OK;
+}
+
+function validateItem(item) {
+  if (!isObject(item) || !onlyKeys(item, ITEM_KEYS)) return refuse('item is not an object with known keys');
+  if (!textWithin(item.id, 1, 32)) return refuse('item id must be 1 to 32 characters');
+  if (!textWithin(item.name, 1, 60)) return refuse('item name must be 1 to 60 characters');
+  if (!isInt(item.price) || item.price < 0) return refuse('item price must be a whole number of minor units, zero or more');
+  if (item.max !== undefined && (!isInt(item.max) || item.max < 1 || item.max > 99)) return refuse('item max must be 1 to 99');
+  return OK;
+}
+
+// Builds the answer from the quantity text per item id: qtys maps each id to the
+// text in its quantity box. Returns {ok:true, answer} or {ok:false, error}.
+function buildPickItemsResult(spec, qtys, ref) {
+  var check = validatePickItemsSpec(spec);
+  if (!check.ok) return check;
+  if (typeof ref !== 'string' || ref.length < 1 || ref.length > MAX_REF) return refuse('invalid reference');
+  if (!isObject(qtys)) return refuse('no quantities');
+  var ids = spec.items.map(function (item) { return item.id; });
+  if (!Object.keys(qtys).every(function (key) { return ids.indexOf(key) >= 0; })) return refuse('unknown item');
+
+  var items = [];
+  for (var i = 0; i < spec.items.length; i += 1) {
+    var item = spec.items[i];
+    var text = Object.prototype.hasOwnProperty.call(qtys, item.id) && typeof qtys[item.id] === 'string'
+      ? qtys[item.id].trim() : '';
+    var qty = 0;
+    if (text !== '') {
+      if (!/^[0-9]+$/.test(text)) return refuse(item.name + ': not a whole number');
+      qty = Number(text);
+    }
+    if (!isInt(qty)) return refuse(item.name + ': not a whole number');
+    if (qty > (item.max === undefined ? 99 : item.max)) return refuse(item.name + ': above the maximum');
+    if (qty >= 1) items.push({ id: item.id, qty: qty });
+  }
+  if (items.length < 1) return refuse('choose at least one item');
+
+  var answer = { v: 1, r: ref, page: PICK_ITEMS_PAGE, items: items };
+  if (answerBytes(answer) > MAX_ANSWER_BYTES) return refuse('the answer is too large to send');
+  return { ok: true, answer: answer };
+}
+
+// Minor units shown as a decimal amount with `decimals` places (0 to 3), then the
+// currency code. The split is integer arithmetic: the remainder of a safe integer
+// by a power of ten is exact, so no float rounding reaches the digits.
+function formatPrice(price, currency, decimals) {
+  var unit = Math.pow(10, decimals);
+  var fraction = price % unit;
+  var text = String((price - fraction) / unit);
+  if (decimals > 0) text += '.' + String(fraction).padStart(decimals, '0');
+  return text + ' ' + currency;
+}
+
+function init() {
+  var tg = (window.Telegram && window.Telegram.WebApp) || null;
+  var $ = function (id) { return document.getElementById(id); };
+  var ref = null;
+  var qtyInputs = Object.create(null);
+  var sendOnce = createSendOnce();
+
+  function show(id, on) { $(id).hidden = !on; }
+  function setText(id, text) { $(id).textContent = text; }
+
+  function closeApp() {
+    if (!tg) { setText('errorText', 'Not inside Telegram: nothing to close.'); return; }
+    try { tg.close(); } catch (e) { setText('errorText', 'Could not close: ' + e.name); }
+  }
+
+  // Returns true when sendData returned, false when nothing was sent.
+  function send(answer) {
+    setText('formError', '');
+    if (!tg) { setText('formError', 'Not inside Telegram: nothing sent.'); return false; }
+    try {
+      tg.sendData(JSON.stringify(answer));
+      return true;
+    } catch (e) {
+      setText('formError', 'Could not send: ' + e.name);
+      return false;
+    }
+  }
+
+  function readQtys() {
+    var qtys = Object.create(null);
+    Object.keys(qtyInputs).forEach(function (id) { qtys[id] = qtyInputs[id].value; });
+    return qtys;
+  }
+
+  // Moves an item's quantity by delta, kept between 0 and its max.
+  function step(item, delta) {
+    var input = qtyInputs[item.id];
+    var current = /^[0-9]+$/.test(input.value.trim()) ? Number(input.value.trim()) : 0;
+    var max = item.max === undefined ? 99 : item.max;
+    input.value = String(Math.min(max, Math.max(0, current + delta)));
+  }
+
+  function renderItem(item, index) {
+    var wrap = document.createElement('div');
+    var name = document.createElement('p');
+    var price = document.createElement('p');
+    var stepper = document.createElement('div');
+    var less = document.createElement('button');
+    var more = document.createElement('button');
+    var input = document.createElement('input');
+
+    wrap.className = 'item';
+    name.className = 'item-name';
+    name.textContent = item.name;
+    price.className = 'item-price';
+    price.textContent = formatPrice(item.price, spec.currency, spec.decimals === undefined ? 2 : spec.decimals);
+    stepper.className = 'stepper';
+    var labels = quantityLabels(item.name);
+    less.type = 'button';
+    less.className = 'secondary';
+    less.textContent = '−';
+    less.setAttribute('aria-label', labels.less);
+    more.type = 'button';
+    more.textContent = '+';
+    more.setAttribute('aria-label', labels.more);
+    input.id = 'q_' + index;
+    input.setAttribute('inputmode', 'numeric');
+    input.setAttribute('autocomplete', 'off');
+    input.setAttribute('aria-label', labels.input);
+    input.value = '0';
+
+    less.addEventListener('click', function () { step(item, -1); });
+    more.addEventListener('click', function () { step(item, 1); });
+    qtyInputs[item.id] = input;
+
+    stepper.appendChild(less);
+    stepper.appendChild(input);
+    stepper.appendChild(more);
+    wrap.appendChild(name);
+    wrap.appendChild(price);
+    wrap.appendChild(stepper);
+    $('items').appendChild(wrap);
+  }
+
+  var parsed = parseFragment(location.hash);
+  var spec = parsed.ok ? specFromFragment(parsed.data) : null;
+  if (!parsed.ok || !validatePickItemsSpec(spec).ok) {
+    show('page', false);
+    setText('errorText', FRAGMENT_ERROR);
+    show('error', true);
+    $('btnCloseError').addEventListener('click', closeApp);
+    if (tg) try { tg.ready(); } catch (e) { /* the error is already shown */ }
+    return;
+  }
+
+  ref = parsed.data.r;
+  setText('title', typeof spec.title === 'string' ? spec.title : DEFAULT_TITLE);
+  spec.items.forEach(renderItem);
+  show('page', true);
+
+  $('form').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    setText('formError', '');
+    var built = buildPickItemsResult(spec, readQtys(), ref);
+    if (!built.ok) { setText('formError', built.error); return; }
+    sendOnce(function () {
+      $('btnSubmit').disabled = true;
+      if (!send(built.answer)) { sendOnce.release(); $('btnSubmit').disabled = false; }
+    });
+  });
+
+  if (tg) try { tg.ready(); tg.expand(); } catch (e) { setText('formError', 'ready/expand failed: ' + e.name); }
+}
+
+window.__page = {
+  parseFragment: parseFragment,
+  specFromFragment: specFromFragment,
+  createSendOnce: createSendOnce,
+  validatePickItemsSpec: validatePickItemsSpec,
+  buildPickItemsResult: buildPickItemsResult,
+  formatPrice: formatPrice,
+  quantityLabels: quantityLabels
+};
+
+if (typeof document !== 'undefined') {
+  init();
+}
+</script>
+</body>
+</html>

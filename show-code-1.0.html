@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Show code</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root { color-scheme: light dark; --bg: #ffffff; --fg: #000000; --accent: #0a58ca; --on-accent: #ffffff; --err: #b00020; --panel: #eeeeee; --code-bg: #ffffff; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #000000; --fg: #ffffff; --accent: #4da3ff; --on-accent: #000000; --err: #ff8a80; --panel: #1c1c1e; --code-bg: #ffffff; } }
+  :root[data-theme="dark"] { --bg: #000000; --fg: #ffffff; --accent: #4da3ff; --on-accent: #000000; --err: #ff8a80; --panel: #1c1c1e; --code-bg: #ffffff; }
+  *, *::before, *::after { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; padding: 16px; min-height: 100vh; background: var(--bg); color: var(--fg); font: 16px/1.4 -apple-system, system-ui, sans-serif; }
+  h1 { font-size: 22px; margin: 0 0 12px; overflow-wrap: anywhere; }
+  p { margin: 8px 0; overflow-wrap: anywhere; }
+  button { display: block; width: 100%; min-height: 44px; margin: 16px 0 8px; font: inherit; font-size: 17px; border: 0; border-radius: 10px; background: var(--accent); color: var(--on-accent); }
+  button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .err { color: var(--err); font-weight: 600; }
+  /* Scanners need dark modules on a light field, so the code area ignores the theme. */
+  .codebox { background: var(--code-bg); color: #000000; padding: 16px; border-radius: 12px; text-align: center; }
+  canvas { display: block; max-width: 100%; height: auto; margin: 0 auto; image-rendering: pixelated; image-rendering: crisp-edges; }
+  .label { font-weight: 600; margin-top: 12px; }
+  .token { font-family: ui-monospace, Menlo, monospace; font-size: 16px; word-break: break-all; user-select: text; -webkit-user-select: text; background: var(--panel); padding: 10px; border-radius: 8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="title">Code</h1>
+
+  <section id="error" role="alert" hidden>
+    <p id="errorText" class="err"></p>
+  </section>
+
+  <section id="content" hidden>
+    <div class="codebox">
+      <canvas id="qr" role="img" aria-label="QR code. The same text is printed below it."></canvas>
+    </div>
+    <p id="label" class="label"></p>
+    <p id="token" class="token"></p>
+  </section>
+
+  <button id="btnClose" type="button">Close</button>
+</main>
+<script>
+'use strict';
+
+// Show-code page 1.0. The host renders the QR matrix and sends it packed; the
+// page only draws it and prints the token. It never sends anything back.
+// Pure functions below never touch document or Telegram; the DOM wiring at the
+// end runs only in a browser.
+
+var MAX_TOKEN = 200;
+var MAX_LABEL = 60;
+var MAX_QR_SIZE = 177;
+var QUIET_ZONE = 4;
+var FRAGMENT_ERROR = 'This link is not valid. Go back to the chat and open it again.';
+var CODE_ERROR = 'This code could not be shown. Go back to the chat and open it again.';
+
+// base64url (RFC 4648 section 5, no padding) -> bytes.
+function base64urlToBytes(s) {
+  var b = s.replace(/-/g, '+').replace(/_/g, '/');
+  while (b.length % 4) b += '=';
+  return Uint8Array.from(atob(b), function (c) { return c.charCodeAt(0); });
+}
+
+// Telegram appends tgWebAppData, tgWebAppVersion and the like in any order, so
+// d is found by its name. The error is a fixed message: it never echoes input.
+function parseFragment(hash) {
+  var raw = typeof hash === 'string' ? hash : '';
+  if (raw.charAt(0) === '#') raw = raw.slice(1);
+  var parts = raw.split('&');
+  var d = null;
+  for (var i = 0; i < parts.length; i += 1) {
+    var eq = parts[i].indexOf('=');
+    if (eq >= 0 && parts[i].slice(0, eq) === 'd') { d = parts[i].slice(eq + 1); break; }
+  }
+  if (d === null || !/^[A-Za-z0-9_-]+$/.test(d)) return { ok: false, error: 'invalid fragment' };
+  var data;
+  try {
+    data = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(base64urlToBytes(d)));
+  } catch (e) {
+    return { ok: false, error: 'invalid fragment' };
+  }
+  if (!data || typeof data !== 'object' || data.v !== 1) return { ok: false, error: 'invalid fragment' };
+  if (typeof data.r !== 'string' || data.r.length < 1 || data.r.length > 64) {
+    return { ok: false, error: 'invalid fragment' };
+  }
+  return { ok: true, data: data };
+}
+
+// qr: { n, bits } where bits is base64url of the n*n modules, row-major, 8 per
+// byte, most significant bit first, 1 = dark. Returns boolean[][], or null when
+// n is out of range, bits is not base64url, or the byte count is not ceil(n*n/8).
+function decodeQr(qr) {
+  if (!qr || typeof qr !== 'object') return null;
+  var n = qr.n;
+  if (!Number.isInteger(n) || n < 1 || n > MAX_QR_SIZE) return null;
+  if (typeof qr.bits !== 'string' || !/^[A-Za-z0-9_-]*$/.test(qr.bits)) return null;
+  var packed;
+  try {
+    packed = base64urlToBytes(qr.bits);
+  } catch (e) {
+    return null;
+  }
+  if (packed.length !== Math.ceil((n * n) / 8)) return null;
+  var rows = [];
+  for (var r = 0; r < n; r += 1) {
+    var row = [];
+    for (var c = 0; c < n; c += 1) {
+      var k = r * n + c;
+      row.push(((packed[k >> 3] >> (7 - (k & 7))) & 1) === 1);
+    }
+    rows.push(row);
+  }
+  return rows;
+}
+
+// Checks the fields the page shows. Returns null when any is missing or out of
+// range, so nothing is drawn from a bad message.
+function readShowCodeInput(data) {
+  if (!data || typeof data !== 'object') return null;
+  var token = data.token;
+  if (typeof token !== 'string' || token.length < 1 || token.length > MAX_TOKEN) return null;
+  if (data.label !== undefined && (typeof data.label !== 'string' || data.label.length > MAX_LABEL)) return null;
+  if (data.title !== undefined && (typeof data.title !== 'string' || data.title.length > MAX_LABEL)) return null;
+  var modules = decodeQr(data.qr);
+  if (modules === null) return null;
+  return {
+    token: token,
+    label: data.label === undefined ? '' : data.label,
+    title: data.title === undefined || data.title === '' ? 'Code' : data.title,
+    modules: modules
+  };
+}
+
+// Integer pixels per module so the whole code, quiet zone included, fits the
+// width; at least 1, and 4 or more whenever 4 fits.
+function qrLayout(n, widthPx) {
+  var total = n + 2 * QUIET_ZONE;
+  var scale = Math.max(1, Math.floor(widthPx / total));
+  return { scale: scale, sizePx: total * scale };
+}
+
+function init() {
+  var tg = (window.Telegram && window.Telegram.WebApp) || null;
+  var $ = function (id) { return document.getElementById(id); };
+
+  function setText(id, text) { $(id).textContent = text; }
+  function show(id, on) { $(id).hidden = !on; }
+
+  function closeApp() {
+    if (!tg) { setText('errorText', 'Not inside Telegram: nothing to close.'); show('error', true); return; }
+    try { tg.close(); } catch (e) { setText('errorText', 'Could not close: ' + e.name); show('error', true); }
+  }
+
+  function drawCode(canvas, modules, layout) {
+    var ctx = canvas.getContext('2d');
+    canvas.width = layout.sizePx;
+    canvas.height = layout.sizePx;
+    canvas.style.width = layout.sizePx + 'px';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, layout.sizePx, layout.sizePx);
+    ctx.fillStyle = '#000000';
+    for (var r = 0; r < modules.length; r += 1) {
+      for (var c = 0; c < modules.length; c += 1) {
+        if (modules[r][c]) {
+          ctx.fillRect((c + QUIET_ZONE) * layout.scale, (r + QUIET_ZONE) * layout.scale, layout.scale, layout.scale);
+        }
+      }
+    }
+  }
+
+  var parsed = parseFragment(location.hash);
+  var view = parsed.ok ? readShowCodeInput(parsed.data) : null;
+  $('btnClose').addEventListener('click', closeApp);
+
+  if (!view) {
+    setText('errorText', parsed.ok ? CODE_ERROR : FRAGMENT_ERROR);
+    show('error', true);
+  } else {
+    setText('title', view.title);
+    document.title = view.title;
+    setText('label', view.label);
+    show('label', view.label !== '');
+    setText('token', view.token);
+    show('content', true);
+    var canvas = $('qr');
+    var width = Math.max(64, canvas.parentElement.clientWidth - 32);
+    drawCode(canvas, view.modules, qrLayout(view.modules.length, width));
+  }
+
+  if (tg) try { tg.ready(); tg.expand(); } catch (e) { /* the page still works without them */ }
+}
+
+window.__page = {
+  parseFragment: parseFragment,
+  decodeQr: decodeQr,
+  readShowCodeInput: readShowCodeInput,
+  qrLayout: qrLayout
+};
+
+if (typeof document !== 'undefined') {
+  init();
+}
+</script>
+</body>
+</html>

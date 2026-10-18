@@ -1,0 +1,471 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root { color-scheme: light dark; --bg: #ffffff; --fg: #000000; --accent: #0a58ca; --on-accent: #ffffff; --err: #b00020; --panel: #eeeeee; --field: #ffffff; --edge: #767676; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #000000; --fg: #ffffff; --accent: #4da3ff; --on-accent: #000000; --err: #ff8a80; --panel: #1c1c1e; --field: #1c1c1e; --edge: #8e8e93; } }
+  :root[data-theme="dark"] { --bg: #000000; --fg: #ffffff; --accent: #4da3ff; --on-accent: #000000; --err: #ff8a80; --panel: #1c1c1e; --field: #1c1c1e; --edge: #8e8e93; }
+  *, *::before, *::after { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; padding: 16px; min-height: 100vh; background: var(--bg); color: var(--fg); font: 16px/1.4 -apple-system, system-ui, sans-serif; }
+  h1 { font-size: 22px; margin: 0 0 8px; }
+  p { margin: 8px 0; overflow-wrap: anywhere; }
+  button { display: block; width: 100%; min-height: 44px; margin: 8px 0; font: inherit; font-size: 17px; border: 0; border-radius: 10px; background: var(--accent); color: var(--on-accent); }
+  button.secondary { background: var(--panel); color: var(--fg); }
+  button:disabled { opacity: 0.45; }
+  button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .statement { font-weight: 600; }
+  .pad { display: block; width: 100%; height: auto; aspect-ratio: 16 / 10; margin: 12px 0 4px; background: var(--field); border: 1px solid var(--edge); border-radius: 10px; touch-action: none; user-select: none; -webkit-user-select: none; }
+  .err { color: var(--err); font-weight: 600; }
+  .note { color: var(--fg); }
+</style>
+</head>
+<body>
+<main>
+  <section id="error" role="alert" hidden>
+    <p id="errorText" class="err"></p>
+    <button id="btnCloseError" type="button">Close</button>
+  </section>
+
+  <section id="content" hidden>
+    <h1 id="title"></h1>
+    <p id="statement" class="statement"></p>
+
+    <canvas id="pad" class="pad" width="576" height="360" role="img" aria-label="Signature area. Draw your signature with a finger or mouse."></canvas>
+    <p class="note">Draw inside the box. Clear it to start again.</p>
+
+    <button id="btnClear" type="button" class="secondary">Clear</button>
+    <button id="btnSend" type="button" disabled>Send signature</button>
+    <p id="signError" class="err" role="alert"></p>
+  </section>
+</main>
+<script>
+'use strict';
+
+// Sign page 1.0. The host opens it from a reply-keyboard button with
+// #d=<base64url(JSON)>, and the page answers once with sendData. The customer
+// draws on a canvas; points are quantised to a 0..255 grid and sent as flat
+// integer arrays. Pure functions below never touch document or Telegram; the DOM
+// wiring at the end runs only in a browser.
+
+var MAX_REF = 64;
+var MAX_TITLE = 60;
+var MAX_STATEMENT = 300;
+var MAX_STROKES = 40;
+var MAX_POINTS = 2000;
+var MAX_ANSWER_BYTES = 4096;
+var TARGET_BYTES = 3500;
+var DEFAULT_TITLE = 'Sign';
+var FRAGMENT_ERROR = 'This link is not valid. Go back to the chat and open it again.';
+var TOO_DETAILED = 'That signature is too detailed to send. Clear it and sign again more simply.';
+// Growing Ramer-Douglas-Peucker tolerances, in grid units (0..255).
+var EPSILONS = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 255];
+
+// base64url (RFC 4648 section 5, no padding) -> bytes.
+function base64urlToBytes(s) {
+  var b = s.replace(/-/g, '+').replace(/_/g, '/');
+  while (b.length % 4) b += '=';
+  return Uint8Array.from(atob(b), function (c) { return c.charCodeAt(0); });
+}
+
+// Telegram appends tgWebAppData, tgWebAppVersion and the like in any order, so
+// d is found by its name. The error is a fixed message: it never echoes input.
+function parseFragment(hash) {
+  var raw = typeof hash === 'string' ? hash : '';
+  if (raw.charAt(0) === '#') raw = raw.slice(1);
+  var parts = raw.split('&');
+  var d = null;
+  for (var i = 0; i < parts.length; i += 1) {
+    var eq = parts[i].indexOf('=');
+    if (eq >= 0 && parts[i].slice(0, eq) === 'd') { d = parts[i].slice(eq + 1); break; }
+  }
+  if (d === null || !/^[A-Za-z0-9_-]+$/.test(d)) return { ok: false, error: 'invalid fragment' };
+  var data;
+  try {
+    data = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(base64urlToBytes(d)));
+  } catch (e) {
+    return { ok: false, error: 'invalid fragment' };
+  }
+  if (!data || typeof data !== 'object' || data.v !== 1) return { ok: false, error: 'invalid fragment' };
+  if (typeof data.r !== 'string' || data.r.length < 1 || data.r.length > MAX_REF) {
+    return { ok: false, error: 'invalid fragment' };
+  }
+  return { ok: true, data: data };
+}
+
+// The spec the host sent: a statement of 1 to 300 characters that is not blank,
+// and an optional title of at most 60 characters (blank shows the default).
+// Returns null for anything else, so the page shows the fixed error.
+function readSignInput(data) {
+  if (!data || typeof data !== 'object') return null;
+  var statement = data.statement;
+  if (typeof statement !== 'string' || statement.trim() === '' || Array.from(statement).length > MAX_STATEMENT) return null;
+  var title = data.title;
+  if (title === undefined) title = DEFAULT_TITLE;
+  if (typeof title !== 'string' || Array.from(title).length > MAX_TITLE) return null;
+  if (title.trim() === '') title = DEFAULT_TITLE;
+  return { title: title, statement: statement };
+}
+
+// Pointer positions are fractions of the canvas (0 to 1). Each becomes an integer
+// 0..255; anything outside the box is clamped, anything not finite becomes 0.
+// The result is flat: [x0, y0, x1, y1, ...].
+function quantise(points) {
+  var out = [];
+  for (var i = 0; i < points.length; i += 1) {
+    out.push(quantiseOne(points[i].x), quantiseOne(points[i].y));
+  }
+  return out;
+}
+
+function quantiseOne(v) {
+  var c = Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 0;
+  return Math.round(c * 255);
+}
+
+// The number of points in a set of flat strokes.
+function pointCount(strokes) {
+  var n = 0;
+  for (var i = 0; i < strokes.length; i += 1) n += strokes[i].length / 2;
+  return n;
+}
+
+// Removes what cannot change the shape: consecutive duplicate points, and points that
+// lie exactly on the segment between their neighbours, going the same way (zero cross
+// product, positive dot product). Grid coordinates are integers, so this is exact.
+// The first and last points are always kept.
+function tidyStroke(flat) {
+  var n = flat.length / 2;
+  var xs = [], ys = [];
+  for (var i = 0; i < n; i += 1) {
+    var x = flat[2 * i], y = flat[2 * i + 1];
+    var top = xs.length - 1;
+    if (top >= 0 && xs[top] === x && ys[top] === y) continue;
+    while (xs.length >= 2) {
+      var p = xs.length - 2, q = xs.length - 1;
+      var ux = xs[q] - xs[p], uy = ys[q] - ys[p];
+      var vx = x - xs[q], vy = y - ys[q];
+      if (ux * vy - uy * vx !== 0 || ux * vx + uy * vy <= 0) break;
+      xs.pop();
+      ys.pop();
+    }
+    xs.push(x);
+    ys.push(y);
+  }
+  var out = [];
+  for (var j = 0; j < xs.length; j += 1) out.push(xs[j], ys[j]);
+  // A stroke whose ends coincide keeps both of its endpoints.
+  if (xs.length === 1 && n >= 2) out.push(xs[0], ys[0]);
+  return out;
+}
+
+// Ramer-Douglas-Peucker on one stroke, after tidyStroke. Iterative: an explicit stack
+// of index ranges, no recursion. The first and last point are always kept.
+function simplifyStroke(flat, epsilon) {
+  var pts = tidyStroke(flat);
+  var n = pts.length / 2;
+  if (n <= 2) return pts;
+  var keep = [];
+  for (var k = 0; k < n; k += 1) keep.push(false);
+  keep[0] = true;
+  keep[n - 1] = true;
+  var limit = epsilon * epsilon;
+  var stack = [[0, n - 1]];
+  while (stack.length > 0) {
+    var range = stack.pop();
+    if (range === undefined) break;
+    var a = range[0], b = range[1];
+    var worst = -1, at = -1;
+    // The segment a-b is fixed for the whole scan, so its terms are hoisted out of it.
+    var ax = pts[2 * a], ay = pts[2 * a + 1];
+    var dx = pts[2 * b] - ax, dy = pts[2 * b + 1] - ay;
+    var len2 = dx * dx + dy * dy;
+    for (var i = a + 1; i < b; i += 1) {
+      var px = pts[2 * i], py = pts[2 * i + 1];
+      var t = len2 === 0 ? 0 : ((px - ax) * dx + (py - ay) * dy) / len2;
+      if (t < 0) t = 0; else if (t > 1) t = 1;
+      var ex = px - (ax + t * dx), ey = py - (ay + t * dy);
+      var d = ex * ex + ey * ey;
+      if (d > worst) { worst = d; at = i; }
+    }
+    if (at >= 0 && worst > limit) {
+      keep[at] = true;
+      stack.push([a, at], [at, b]);
+    }
+  }
+  var out = [];
+  for (var j = 0; j < n; j += 1) {
+    if (keep[j]) out.push(pts[2 * j], pts[2 * j + 1]);
+  }
+  return out;
+}
+
+// Simplifies every stroke with the same tolerance.
+function simplify(strokes, epsilon) {
+  return strokes.map(function (stroke) { return simplifyStroke(stroke, epsilon); });
+}
+
+function envelope(ref, strokes) {
+  return { v: 1, r: ref, page: 'sign', strokes: strokes };
+}
+
+function answerBytes(result) {
+  return new TextEncoder().encode(JSON.stringify(result)).length;
+}
+
+// The strokes as they are if they fit in maxBytes, else the simplification with the
+// smallest tolerance in EPSILONS that fits, else null. The answer only gets smaller as
+// the tolerance grows, so a binary search finds that tolerance: 16 candidates take at
+// most 5 simplify passes. The size is measured with a reference as long as the longest
+// allowed one, so the real answer is never larger.
+function fitStrokes(strokes, maxBytes) {
+  var worstRef = new Array(MAX_REF + 1).join('x');
+  function fits(candidate) { return answerBytes(envelope(worstRef, candidate)) <= maxBytes; }
+  if (fits(strokes)) return strokes;
+  // Invariant: best is the simplification at EPSILONS[hi], the smallest index known to fit.
+  var hi = EPSILONS.length - 1;
+  var best = simplify(strokes, EPSILONS[hi]);
+  if (!fits(best)) return null;
+  var lo = 0;
+  while (lo < hi) {
+    var mid = Math.floor((lo + hi) / 2);
+    var candidate = simplify(strokes, EPSILONS[mid]);
+    if (fits(candidate)) {
+      hi = mid;
+      best = candidate;
+    } else {
+      lo = mid + 1;
+    }
+  }
+  return best;
+}
+
+// Shape only: an array of strokes, each an even array of integers 0..255 with at
+// least one point. The caps on the number of strokes and points are checked after
+// simplification, in buildSignResult.
+function wellFormed(strokes) {
+  if (!Array.isArray(strokes)) return false;
+  for (var i = 0; i < strokes.length; i += 1) {
+    var s = strokes[i];
+    if (!Array.isArray(s) || s.length < 2 || s.length % 2 !== 0) return false;
+    for (var j = 0; j < s.length; j += 1) {
+      if (!Number.isInteger(s[j]) || s[j] < 0 || s[j] > 255) return false;
+    }
+  }
+  return true;
+}
+
+// The caps the host decoder applies: 1 to 40 strokes, and 2 to 2000 points in total.
+function withinCaps(strokes) {
+  if (strokes.length < 1 || strokes.length > MAX_STROKES) return false;
+  var points = pointCount(strokes);
+  return points >= 2 && points <= MAX_POINTS;
+}
+
+// The answer: the strokes simplified if needed to fit 3500 bytes, then checked against
+// the caps. A long scribble is refused only when it still breaks a cap, or does not
+// fit, after simplification. Null when the ref is bad or the strokes are malformed.
+function buildSignResult(ref, strokes) {
+  if (typeof ref !== 'string' || ref.length < 1 || ref.length > MAX_REF) return null;
+  if (!wellFormed(strokes)) return null;
+  var fitted = fitStrokes(strokes, TARGET_BYTES);
+  if (fitted === null || !withinCaps(fitted)) return null;
+  var result = envelope(ref, fitted);
+  if (answerBytes(result) > MAX_ANSWER_BYTES) return null;
+  return result;
+}
+
+// Returns once(fn): the first call runs fn and returns true; later calls return false
+// until once.release() is called after a send that did not go.
+function createSendOnce() {
+  var sent = false;
+  function once(fn) {
+    if (sent) return false;
+    sent = true;
+    fn();
+    return true;
+  }
+  once.release = function () { sent = false; };
+  return once;
+}
+
+function init() {
+  var tg = (window.Telegram && window.Telegram.WebApp) || null;
+  var $ = function (id) { return document.getElementById(id); };
+  var ref = null;
+  var sendOnce = createSendOnce();
+  var started = false;
+  var strokes = [];
+  var current = null;
+  var activePointer = null;
+  var pad = $('pad');
+  var ctx = pad.getContext('2d');
+
+  function show(id, on) { $(id).hidden = !on; }
+  function setText(id, text) { $(id).textContent = text; }
+
+  function closeApp() {
+    if (!tg) { setText('errorText', 'Not inside Telegram: nothing to close.'); return; }
+    try { tg.close(); } catch (e) { setText('errorText', 'Could not close: ' + e.name); }
+  }
+
+  function showFragmentError() {
+    show('content', false);
+    setText('errorText', FRAGMENT_ERROR);
+    show('error', true);
+    $('btnCloseError').addEventListener('click', closeApp);
+    if (tg) try { tg.ready(); } catch (e) { /* the error is already shown */ }
+  }
+
+  // Returns true when sendData was called without throwing.
+  function send(result) {
+    setText('signError', '');
+    if (!tg) { setText('signError', 'Not inside Telegram: nothing sent.'); return false; }
+    try {
+      tg.sendData(JSON.stringify(result));
+      return true;
+    } catch (e) {
+      setText('signError', 'Could not send: ' + e.name);
+      return false;
+    }
+  }
+
+  function disableAll() {
+    started = true;
+    $('btnSend').disabled = true;
+    $('btnClear').disabled = true;
+  }
+
+  function updateSend() {
+    $('btnSend').disabled = started || strokes.length === 0;
+  }
+
+  // Pixel space: the canvas is 576 by 360, and a grid value v maps to v / 255 of it.
+  function toGrid(ev) {
+    var rect = pad.getBoundingClientRect();
+    var q = quantise([{ x: (ev.clientX - rect.left) / rect.width, y: (ev.clientY - rect.top) / rect.height }]);
+    return [q[0], q[1]];
+  }
+
+  function toPixel(v, size) { return v / 255 * size; }
+
+  function drawSegment(from, to) {
+    if (ctx === null) return;
+    ctx.beginPath();
+    ctx.moveTo(toPixel(from[0], pad.width), toPixel(from[1], pad.height));
+    ctx.lineTo(toPixel(to[0], pad.width), toPixel(to[1], pad.height));
+    ctx.stroke();
+  }
+
+  function endStroke() {
+    activePointer = null;
+    if (current !== null && current.length >= 4) {
+      strokes.push(current);
+    }
+    current = null;
+    updateSend();
+  }
+
+  pad.addEventListener('pointerdown', function (ev) {
+    if (started || activePointer !== null) return;
+    ev.preventDefault();
+    activePointer = ev.pointerId;
+    try { pad.setPointerCapture(ev.pointerId); } catch (e) { /* drawing still works without capture */ }
+    var p = toGrid(ev);
+    current = [p[0], p[1]];
+  });
+
+  pad.addEventListener('pointermove', function (ev) {
+    if (started || current === null || ev.pointerId !== activePointer) return;
+    var p = toGrid(ev);
+    var last = [current[current.length - 2], current[current.length - 1]];
+    if (p[0] === last[0] && p[1] === last[1]) return;
+    drawSegment(last, p);
+    current.push(p[0], p[1]);
+  });
+
+  pad.addEventListener('pointerup', function (ev) {
+    if (ev.pointerId !== activePointer) return;
+    endStroke();
+  });
+
+  pad.addEventListener('pointercancel', function (ev) {
+    if (ev.pointerId !== activePointer) return;
+    endStroke();
+  });
+
+  if (ctx !== null) {
+    ctx.lineWidth = 4;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    var ink = getComputedStyle(document.documentElement).getPropertyValue('--fg').trim();
+    ctx.strokeStyle = ink || '#000000';
+  }
+
+  $('btnClear').addEventListener('click', function () {
+    if (started) return;
+    strokes = [];
+    current = null;
+    activePointer = null;
+    if (ctx !== null) ctx.clearRect(0, 0, pad.width, pad.height);
+    setText('signError', '');
+    updateSend();
+  });
+
+  $('btnSend').addEventListener('click', function () {
+    if (started) return;
+    setText('signError', '');
+    var result = buildSignResult(ref, strokes);
+    if (result === null) {
+      setText('signError', TOO_DETAILED);
+      return;
+    }
+    sendOnce(function () {
+      disableAll();
+      if (!send(result)) {
+        // The answer did not go: release the guard and the buttons so the customer can try again.
+        sendOnce.release();
+        started = false;
+        $('btnClear').disabled = false;
+        updateSend();
+      }
+    });
+  });
+
+  var parsed = parseFragment(location.hash);
+  var input = parsed.ok ? readSignInput(parsed.data) : null;
+  if (!parsed.ok || input === null) {
+    showFragmentError();
+    return;
+  }
+
+  ref = parsed.data.r;
+  setText('title', input.title);
+  setText('statement', input.statement);
+  show('content', true);
+  updateSend();
+
+  if (tg) try { tg.ready(); tg.expand(); } catch (e) { setText('signError', 'ready/expand failed: ' + e.name); }
+}
+
+window.__page = {
+  parseFragment: parseFragment,
+  readSignInput: readSignInput,
+  quantise: quantise,
+  simplify: simplify,
+  fitStrokes: fitStrokes,
+  buildSignResult: buildSignResult,
+  pointCount: pointCount,
+  createSendOnce: createSendOnce
+};
+
+if (typeof document !== 'undefined') {
+  init();
+}
+</script>
+</body>
+</html>

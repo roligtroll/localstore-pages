@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Form</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root { color-scheme: light dark; --bg: #ffffff; --fg: #000000; --accent: #0a58ca; --on-accent: #ffffff; --err: #b00020; --panel: #eeeeee; --field: #ffffff; --edge: #767676; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #000000; --fg: #ffffff; --accent: #4da3ff; --on-accent: #000000; --err: #ff8a80; --panel: #1c1c1e; --field: #1c1c1e; --edge: #8e8e93; } }
+  :root[data-theme="dark"] { --bg: #000000; --fg: #ffffff; --accent: #4da3ff; --on-accent: #000000; --err: #ff8a80; --panel: #1c1c1e; --field: #1c1c1e; --edge: #8e8e93; }
+  *, *::before, *::after { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; padding: 16px; min-height: 100vh; background: var(--bg); color: var(--fg); font: 16px/1.4 -apple-system, system-ui, sans-serif; }
+  h1 { font-size: 22px; margin: 0 0 8px; overflow-wrap: anywhere; }
+  p { margin: 8px 0; overflow-wrap: anywhere; }
+  label { display: block; margin: 16px 0 6px; font-weight: 600; overflow-wrap: anywhere; }
+  input, select { display: block; width: 100%; min-height: 44px; padding: 10px 12px; font: inherit; font-size: 16px; color: var(--fg); background: var(--field); border: 1px solid var(--edge); border-radius: 10px; }
+  button { display: block; width: 100%; min-height: 44px; margin: 8px 0; font: inherit; font-size: 17px; border: 0; border-radius: 10px; background: var(--accent); color: var(--on-accent); }
+  button:disabled { opacity: 0.5; }
+  button.secondary { background: var(--panel); color: var(--fg); }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .err { color: var(--err); font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <section id="error" role="alert" hidden>
+    <p id="errorText" class="err"></p>
+    <button id="btnCloseError" type="button">Close</button>
+  </section>
+
+  <section id="page" hidden>
+    <h1 id="title"></h1>
+    <form id="form" novalidate autocomplete="off">
+      <div id="fields"></div>
+      <button id="btnSubmit" type="submit"></button>
+      <p id="formError" class="err" role="alert"></p>
+    </form>
+  </section>
+</main>
+<script>
+'use strict';
+
+// Form page 1.0. The host opens it from a reply-keyboard button with
+// #d=<base64url(JSON)>, and the page answers once with sendData.
+// Pure functions below never touch document or Telegram; the DOM wiring at the
+// end runs only in a browser. The rules mirror src/pages/form.ts: the host
+// refuses any answer these rules would refuse, and form.test.ts checks both.
+
+var MAX_REF = 64;
+var MAX_ANSWER_BYTES = 4096;
+var DEFAULT_TITLE = 'Details';
+var DEFAULT_SUBMIT = 'Send';
+var FRAGMENT_ERROR = 'This link is not valid. Go back to the chat and open it again.';
+var FORM_PAGE = 'form';
+var FIELD_ID_RE = /^[a-z][a-z0-9_]{0,23}$/;
+var PHONE_RE = /^\+?[0-9]{7,15}$/;
+var MIN_PHONE_MAX = 8;
+var CONTROL_OR_BIDI_RE = /[\u0000-\u001F\u007F‪-‮⁦-⁩]/;
+var INT_TEXT_RE = /^-?[0-9]+$/;
+var FIELD_TYPES = ['text', 'number', 'phone', 'choice'];
+var SPEC_KEYS = ['title', 'submit', 'fields'];
+var FIELD_KEYS = ['id', 'type', 'label', 'required', 'max', 'min', 'options'];
+var OPTION_KEYS = ['value', 'label'];
+var ANSWER_KEYS = ['v', 'r', 'page', 'values'];
+var OK = { ok: true };
+
+// base64url (RFC 4648 section 5, no padding) -> bytes.
+function base64urlToBytes(s) {
+  var b = s.replace(/-/g, '+').replace(/_/g, '/');
+  while (b.length % 4) b += '=';
+  return Uint8Array.from(atob(b), function (c) { return c.charCodeAt(0); });
+}
+
+// Telegram appends tgWebAppData, tgWebAppVersion and the like in any order, so
+// d is found by its name. The error is a fixed message: it never echoes input.
+function parseFragment(hash) {
+  var raw = typeof hash === 'string' ? hash : '';
+  if (raw.charAt(0) === '#') raw = raw.slice(1);
+  var parts = raw.split('&');
+  var d = null;
+  for (var i = 0; i < parts.length; i += 1) {
+    var eq = parts[i].indexOf('=');
+    if (eq >= 0 && parts[i].slice(0, eq) === 'd') { d = parts[i].slice(eq + 1); break; }
+  }
+  if (d === null || !/^[A-Za-z0-9_-]+$/.test(d)) return { ok: false, error: 'invalid fragment' };
+  var data;
+  try {
+    data = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(base64urlToBytes(d)));
+  } catch (e) {
+    return { ok: false, error: 'invalid fragment' };
+  }
+  if (!data || typeof data !== 'object' || data.v !== 1) return { ok: false, error: 'invalid fragment' };
+  if (typeof data.r !== 'string' || data.r.length < 1 || data.r.length > MAX_REF) {
+    return { ok: false, error: 'invalid fragment' };
+  }
+  return { ok: true, data: data };
+}
+
+// The spec is the fragment without v and r. A null-prototype copy keeps a key
+// named __proto__ as an ordinary key, so the validator sees it and refuses it.
+function specFromFragment(data) {
+  var spec = Object.create(null);
+  Object.keys(data).forEach(function (key) {
+    if (key !== 'v' && key !== 'r') spec[key] = data[key];
+  });
+  return spec;
+}
+
+// Returns once(fn): the first call runs fn and returns true; later calls return false.
+// once.release() lets the next call run again, after an attempt that sent nothing.
+function createSendOnce() {
+  var sent = false;
+  function once(fn) {
+    if (sent) return false;
+    sent = true;
+    fn();
+    return true;
+  }
+  once.release = function () { sent = false; };
+  return once;
+}
+
+// The keypad for a number field: 'numeric' has no minus key, so it is used only
+// when no answer can be negative (min 0 or more, or no min and max 0 or more).
+function numberInputMode(field) {
+  var noNegative = field.min !== undefined ? field.min >= 0 : field.max !== undefined && field.max >= 0;
+  return noNegative ? 'numeric' : 'text';
+}
+
+function answerBytes(answer) {
+  return new TextEncoder().encode(JSON.stringify(answer)).length;
+}
+
+function isObject(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function onlyKeys(obj, allowed) {
+  return Object.keys(obj).every(function (key) { return allowed.indexOf(key) >= 0; });
+}
+
+// Text of min to max characters, counted by code point.
+function textWithin(value, min, max) {
+  if (typeof value !== 'string') return false;
+  var length = Array.from(value).length;
+  return length >= min && length <= max;
+}
+
+function isInt(value) {
+  return typeof value === 'number' && Number.isSafeInteger(value);
+}
+
+function refuse(error) {
+  return { ok: false, error: error };
+}
+
+// Checks the spec, as src/pages/form.ts validateFormSpec does.
+function validateFormSpec(spec) {
+  if (!isObject(spec) || !onlyKeys(spec, SPEC_KEYS)) return refuse('spec is not an object with known keys');
+  var title = spec.title;
+  var submit = spec.submit;
+  var fields = spec.fields;
+  if (title !== undefined && !textWithin(title, 1, 60)) return refuse('title must be 1 to 60 characters');
+  if (submit !== undefined && !textWithin(submit, 1, 30)) return refuse('submit must be 1 to 30 characters');
+  if (!Array.isArray(fields) || fields.length < 1 || fields.length > 20) return refuse('fields must hold 1 to 20 fields');
+  var seen = [];
+  for (var i = 0; i < fields.length; i += 1) {
+    var check = validateField(fields[i]);
+    if (!check.ok) return check;
+    if (seen.indexOf(fields[i].id) >= 0) return refuse('field ids must be unique');
+    seen.push(fields[i].id);
+  }
+  return OK;
+}
+
+function validateField(field) {
+  if (!isObject(field) || !onlyKeys(field, FIELD_KEYS)) return refuse('field is not an object with known keys');
+  var id = field.id;
+  var type = field.type;
+  var label = field.label;
+  var required = field.required;
+  var max = field.max;
+  var min = field.min;
+  if (typeof id !== 'string' || !FIELD_ID_RE.test(id)) return refuse('field id must match [a-z][a-z0-9_]{0,23}');
+  if (typeof type !== 'string' || FIELD_TYPES.indexOf(type) < 0) return refuse('field type is not supported');
+  if (!textWithin(label, 1, 60)) return refuse('field label must be 1 to 60 characters');
+  if (required !== undefined && typeof required !== 'boolean') return refuse('required must be true or false');
+
+  if (type === 'choice') {
+    if (max !== undefined || min !== undefined) return refuse('a choice field takes no max or min');
+    return validateOptions(field.options);
+  }
+  if (field.options !== undefined) return refuse('options are for choice fields only');
+
+  if (type === 'number') {
+    if (max !== undefined && !isInt(max)) return refuse('number max must be an integer');
+    if (min !== undefined && !isInt(min)) return refuse('number min must be an integer');
+    if (min !== undefined && max !== undefined && min > max) return refuse('number min is above max');
+    return OK;
+  }
+  if (min !== undefined) return refuse('min is for number fields only');
+  var minMax = type === 'phone' ? MIN_PHONE_MAX : 1;
+  if (max !== undefined && (!isInt(max) || max < minMax || max > 200)) return refuse(type + ' max must be ' + minMax + ' to 200');
+  return OK;
+}
+
+function validateOptions(options) {
+  if (!Array.isArray(options) || options.length < 2 || options.length > 20) {
+    return refuse('a choice field needs 2 to 20 options');
+  }
+  var seen = [];
+  for (var i = 0; i < options.length; i += 1) {
+    var option = options[i];
+    if (!isObject(option) || !onlyKeys(option, OPTION_KEYS)) return refuse('option is not an object with known keys');
+    if (!textWithin(option.value, 1, 40) || !textWithin(option.label, 1, 60)) {
+      return refuse('option value is 1 to 40 characters and label is 1 to 60');
+    }
+    if (seen.indexOf(option.value) >= 0) return refuse('option values must be unique');
+    seen.push(option.value);
+  }
+  return OK;
+}
+
+// Builds the answer from what the customer typed: raw maps each field id to the
+// text in its input. Returns {ok:true, answer} or {ok:false, error}.
+function buildFormResult(spec, raw, ref) {
+  var check = validateFormSpec(spec);
+  if (!check.ok) return check;
+  if (typeof ref !== 'string' || ref.length < 1 || ref.length > MAX_REF) return refuse('invalid reference');
+  if (!isObject(raw)) return refuse('no values');
+  var values = {};
+  for (var i = 0; i < spec.fields.length; i += 1) {
+    var field = spec.fields[i];
+    var text = typeof raw[field.id] === 'string' ? raw[field.id] : '';
+    var value = fieldValue(field, text);
+    if (!value.ok) return value;
+    if (value.empty) {
+      if (field.required === true) return refuse(field.label + ': required');
+      continue;
+    }
+    values[field.id] = value.value;
+  }
+  var answer = { v: 1, r: ref, page: FORM_PAGE, values: values };
+  if (answerBytes(answer) > MAX_ANSWER_BYTES) return refuse('the answer is too large to send');
+  return { ok: true, answer: answer };
+}
+
+// One field's text to its value: {ok, empty} for an empty input, {ok, value} otherwise.
+function fieldValue(field, text) {
+  var max = field.max === undefined ? 100 : field.max;
+  if (field.type === 'text') {
+    var t = text.trim();
+    if (t === '') return { ok: true, empty: true };
+    if (CONTROL_OR_BIDI_RE.test(t)) return refuse(field.label + ': remove the control or hidden formatting characters');
+    if (!textWithin(t, 1, max)) return refuse(field.label + ': too long');
+    return { ok: true, value: t };
+  }
+  if (field.type === 'phone') {
+    var p = text.replace(/[\s\-().]/g, '');
+    if (p === '') return { ok: true, empty: true };
+    if (CONTROL_OR_BIDI_RE.test(p)) return refuse(field.label + ': remove the control or hidden formatting characters');
+    if (!PHONE_RE.test(p)) return refuse(field.label + ': not a phone number');
+    if (p.length > max) return refuse(field.label + ': too long');
+    return { ok: true, value: p };
+  }
+  if (field.type === 'number') {
+    var n = text.trim();
+    if (n === '') return { ok: true, empty: true };
+    if (!INT_TEXT_RE.test(n) || !isInt(Number(n))) return refuse(field.label + ': not a whole number');
+    var num = Number(n);
+    if (field.min !== undefined && num < field.min) return refuse(field.label + ': below the minimum');
+    if (field.max !== undefined && num > field.max) return refuse(field.label + ': above the maximum');
+    return { ok: true, value: num };
+  }
+  // choice
+  if (text === '') return { ok: true, empty: true };
+  var match = field.options.some(function (option) { return option.value === text; });
+  if (!match) return refuse(field.label + ': choose one of the options');
+  return { ok: true, value: text };
+}
+
+function init() {
+  var tg = (window.Telegram && window.Telegram.WebApp) || null;
+  var $ = function (id) { return document.getElementById(id); };
+  var ref = null;
+  var inputs = {};
+  var sendOnce = createSendOnce();
+
+  function show(id, on) { $(id).hidden = !on; }
+  function setText(id, text) { $(id).textContent = text; }
+
+  function closeApp() {
+    if (!tg) { setText('errorText', 'Not inside Telegram: nothing to close.'); return; }
+    try { tg.close(); } catch (e) { setText('errorText', 'Could not close: ' + e.name); }
+  }
+
+  // Returns true when sendData returned, false when nothing was sent.
+  function send(answer) {
+    setText('formError', '');
+    if (!tg) { setText('formError', 'Not inside Telegram: nothing sent.'); return false; }
+    try {
+      tg.sendData(JSON.stringify(answer));
+      return true;
+    } catch (e) {
+      setText('formError', 'Could not send: ' + e.name);
+      return false;
+    }
+  }
+
+  function readRaw(fields) {
+    var raw = {};
+    fields.forEach(function (field) { raw[field.id] = inputs[field.id].value; });
+    return raw;
+  }
+
+  function renderField(field) {
+    var wrap = document.createElement('div');
+    var label = document.createElement('label');
+    var control;
+    label.htmlFor = 'f_' + field.id;
+    label.textContent = field.label;
+    if (field.type === 'choice') {
+      control = document.createElement('select');
+      var blank = document.createElement('option');
+      blank.value = '';
+      blank.textContent = 'Choose one';
+      control.appendChild(blank);
+      field.options.forEach(function (option) {
+        var el = document.createElement('option');
+        el.value = option.value;
+        el.textContent = option.label;
+        control.appendChild(el);
+      });
+    } else {
+      control = document.createElement('input');
+      control.type = field.type === 'phone' ? 'tel' : 'text';
+      control.setAttribute('inputmode', field.type === 'phone' ? 'tel' : field.type === 'number' ? numberInputMode(field) : 'text');
+      control.setAttribute('autocapitalize', 'off');
+      control.setAttribute('autocorrect', 'off');
+      control.setAttribute('spellcheck', 'false');
+    }
+    control.id = 'f_' + field.id;
+    control.name = field.id;
+    inputs[field.id] = control;
+    wrap.appendChild(label);
+    wrap.appendChild(control);
+    $('fields').appendChild(wrap);
+  }
+
+  var parsed = parseFragment(location.hash);
+  var spec = parsed.ok ? specFromFragment(parsed.data) : null;
+  if (!parsed.ok || !validateFormSpec(spec).ok) {
+    show('page', false);
+    setText('errorText', FRAGMENT_ERROR);
+    show('error', true);
+    $('btnCloseError').addEventListener('click', closeApp);
+    if (tg) try { tg.ready(); } catch (e) { /* the error is already shown */ }
+    return;
+  }
+
+  ref = parsed.data.r;
+  setText('title', typeof spec.title === 'string' ? spec.title : DEFAULT_TITLE);
+  setText('btnSubmit', typeof spec.submit === 'string' ? spec.submit : DEFAULT_SUBMIT);
+  spec.fields.forEach(renderField);
+  show('page', true);
+
+  $('form').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    setText('formError', '');
+    var built = buildFormResult(spec, readRaw(spec.fields), ref);
+    if (!built.ok) { setText('formError', built.error); return; }
+    sendOnce(function () {
+      $('btnSubmit').disabled = true;
+      if (!send(built.answer)) { sendOnce.release(); $('btnSubmit').disabled = false; }
+    });
+  });
+
+  if (tg) try { tg.ready(); tg.expand(); } catch (e) { setText('formError', 'ready/expand failed: ' + e.name); }
+}
+
+window.__page = {
+  parseFragment: parseFragment,
+  createSendOnce: createSendOnce,
+  specFromFragment: specFromFragment,
+  validateFormSpec: validateFormSpec,
+  buildFormResult: buildFormResult,
+  numberInputMode: numberInputMode
+};
+
+if (typeof document !== 'undefined') {
+  init();
+}
+</script>
+</body>
+</html>
