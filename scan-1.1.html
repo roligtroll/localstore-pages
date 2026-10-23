@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scan code</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root { color-scheme: light dark; --bg: #ffffff; --fg: #000000; --accent: #0a58ca; --on-accent: #ffffff; --err: #b00020; --panel: #eeeeee; --field: #ffffff; --edge: #767676; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #000000; --fg: #ffffff; --accent: #4da3ff; --on-accent: #000000; --err: #ff8a80; --panel: #1c1c1e; --field: #1c1c1e; --edge: #8e8e93; } }
+  :root[data-theme="dark"] { --bg: #000000; --fg: #ffffff; --accent: #4da3ff; --on-accent: #000000; --err: #ff8a80; --panel: #1c1c1e; --field: #1c1c1e; --edge: #8e8e93; }
+  *, *::before, *::after { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; padding: 16px; min-height: 100vh; background: var(--bg); color: var(--fg); font: 16px/1.4 -apple-system, system-ui, sans-serif; }
+  h1 { font-size: 22px; margin: 0 0 8px; }
+  h2 { font-size: 18px; margin: 16px 0 8px; }
+  p { margin: 8px 0; overflow-wrap: anywhere; }
+  label { display: block; margin: 16px 0 6px; font-weight: 600; }
+  input { display: block; width: 100%; min-height: 44px; padding: 10px 12px; font: inherit; font-size: 16px; color: var(--fg); background: var(--field); border: 1px solid var(--edge); border-radius: 10px; }
+  button { display: block; width: 100%; min-height: 44px; margin: 8px 0; font: inherit; font-size: 17px; border: 0; border-radius: 10px; background: var(--accent); color: var(--on-accent); }
+  button.secondary { background: var(--panel); color: var(--fg); }
+  button:focus-visible, input:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .prompt { font-weight: 600; }
+  .code-text { background: var(--panel); padding: 10px; border-radius: 8px; white-space: pre-wrap; word-break: break-all; user-select: text; -webkit-user-select: text; }
+  .err { color: var(--err); font-weight: 600; }
+  .note { color: var(--fg); }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="title">Scan code</h1>
+  <p id="prompt" class="prompt"></p>
+
+  <section id="error" role="alert" hidden>
+    <p id="errorText" class="err"></p>
+    <button id="btnCloseError" type="button">Close</button>
+  </section>
+
+  <section id="entry" hidden>
+    <p id="scanNote" class="note" hidden></p>
+    <button id="btnScan" type="button">Scan QR code</button>
+
+    <form id="typedForm" autocomplete="off">
+      <label id="typedLabel" for="typed">Or type the code</label>
+      <input id="typed" name="typed" type="text" inputmode="text" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" maxlength="500">
+      <button id="btnSendTyped" type="submit">Send code</button>
+    </form>
+    <p id="entryError" class="err" role="alert"></p>
+  </section>
+
+  <section id="confirm" hidden>
+    <h2 id="scannedHeading">Scanned code</h2>
+    <p id="scanned" class="code-text"></p>
+    <button id="btnSendScanned" type="button">Send this code</button>
+    <button id="btnRescan" type="button" class="secondary">Scan again</button>
+    <p id="confirmError" class="err" role="alert"></p>
+  </section>
+</main>
+<script>
+'use strict';
+
+// Scan page 1.1. It adds lang. The host opens it from a reply-keyboard button with
+// #d=<base64url(JSON)>, and the page answers once with sendData.
+// Pure functions below never touch document or Telegram; the DOM wiring at the
+// end runs only in a browser.
+
+var MAX_REF = 64;
+var MAX_PROMPT = 120;
+var MAX_TEXT = 500;
+var MAX_ANSWER_BYTES = 4096;
+var TEXT = {
+  en: {
+    docTitle: 'Scan code',
+    heading: 'Scan code',
+    close: 'Close',
+    scanButton: 'Scan QR code',
+    typedLabel: 'Or type the code',
+    sendTyped: 'Send code',
+    scannedHeading: 'Scanned code',
+    sendScanned: 'Send this code',
+    rescan: 'Scan again',
+    defaultPrompt: 'Scan a code, or type it in below.',
+    notInTelegramClose: 'Not inside Telegram: nothing to close.',
+    couldNotClose: 'Could not close:',
+    tooLong: 'The code is too long to send.',
+    notInTelegramSend: 'Not inside Telegram: nothing sent.',
+    couldNotSend: 'Could not send:',
+    noScanner: 'The QR scanner is not available on this device. Type the code below instead.',
+    badScan: 'That code is empty or longer than 500 characters. Scan again or type it.',
+    scanFailed: 'Scan failed:',
+    enterCode: 'Enter a code of 1 to 500 characters.',
+    emptyScanned: 'That code is empty. Scan again or type it.',
+    readyFailed: 'ready/expand failed:'
+  },
+  es: {
+    docTitle: 'Escanear código',
+    heading: 'Escanear código',
+    close: 'Cerrar',
+    scanButton: 'Escanear código QR',
+    typedLabel: 'O escribe el código',
+    sendTyped: 'Enviar código',
+    scannedHeading: 'Código escaneado',
+    sendScanned: 'Enviar este código',
+    rescan: 'Escanear de nuevo',
+    defaultPrompt: 'Escanea un código o escríbelo abajo.',
+    notInTelegramClose: 'No estás dentro de Telegram: no hay nada que cerrar.',
+    couldNotClose: 'No se pudo cerrar:',
+    tooLong: 'El código es demasiado largo para enviarlo.',
+    notInTelegramSend: 'No estás dentro de Telegram: no se envió nada.',
+    couldNotSend: 'No se pudo enviar:',
+    noScanner: 'El lector de QR no está disponible en este dispositivo. Escribe el código abajo.',
+    badScan: 'Ese código está vacío o tiene más de 500 caracteres. Escanéalo de nuevo o escríbelo.',
+    scanFailed: 'No se pudo escanear:',
+    enterCode: 'Escribe un código de 1 a 500 caracteres.',
+    emptyScanned: 'Ese código está vacío. Escanéalo de nuevo o escríbelo.',
+    readyFailed: 'No se pudo preparar la página:'
+  }
+};
+var FRAGMENT_ERROR = 'Este enlace no es válido. Vuelve al chat y ábrelo de nuevo. / This link is not valid. Go back to the chat and open it again.';
+
+function pageText(lang) {
+  return lang === 'es' ? TEXT.es : TEXT.en;
+}
+
+function readLang(data) {
+  if (data.lang === undefined) return 'en';
+  if (data.lang === 'en' || data.lang === 'es') return data.lang;
+  return null;
+}
+
+function errorText(parsed) {
+  if (!parsed.ok || readLang(parsed.data) === null) return FRAGMENT_ERROR;
+  return null;
+}
+
+// base64url (RFC 4648 section 5, no padding) -> bytes.
+function base64urlToBytes(s) {
+  var b = s.replace(/-/g, '+').replace(/_/g, '/');
+  while (b.length % 4) b += '=';
+  return Uint8Array.from(atob(b), function (c) { return c.charCodeAt(0); });
+}
+
+// Telegram appends tgWebAppData, tgWebAppVersion and the like in any order, so
+// d is found by its name. The error is a fixed message: it never echoes input.
+function parseFragment(hash) {
+  var raw = typeof hash === 'string' ? hash : '';
+  if (raw.charAt(0) === '#') raw = raw.slice(1);
+  var parts = raw.split('&');
+  var d = null;
+  for (var i = 0; i < parts.length; i += 1) {
+    var eq = parts[i].indexOf('=');
+    if (eq >= 0 && parts[i].slice(0, eq) === 'd') { d = parts[i].slice(eq + 1); break; }
+  }
+  if (d === null || !/^[A-Za-z0-9_-]+$/.test(d)) return { ok: false, error: 'invalid fragment' };
+  var data;
+  try {
+    data = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(base64urlToBytes(d)));
+  } catch (e) {
+    return { ok: false, error: 'invalid fragment' };
+  }
+  if (!data || typeof data !== 'object' || data.v !== 1) return { ok: false, error: 'invalid fragment' };
+  if (typeof data.r !== 'string' || data.r.length < 1 || data.r.length > MAX_REF) {
+    return { ok: false, error: 'invalid fragment' };
+  }
+  return { ok: true, data: data };
+}
+
+// The prompt is shown as text only. A missing or oversized prompt falls back.
+function scanPrompt(data) {
+  var p = data.prompt;
+  if (typeof p !== 'string' || p.length > MAX_PROMPT || p.trim() === '') return pageText(readLang(data)).defaultPrompt;
+  return p;
+}
+
+// Telegram's QR popup exists from API version 6.4 on.
+function scannerAvailable(webApp) {
+  return !!webApp && typeof webApp.showScanQrPopup === 'function' &&
+    typeof webApp.isVersionAtLeast === 'function' && webApp.isVersionAtLeast('6.4');
+}
+
+// Telegram's QR popup text holds at most 64 characters. The cut is by code point,
+// so an emoji is never split into a lone surrogate.
+var MAX_POPUP_TEXT = 64;
+function popupText(prompt) {
+  if (typeof prompt !== 'string') return '';
+  return Array.from(prompt.trim()).slice(0, MAX_POPUP_TEXT).join('');
+}
+
+// Returns once(fn): the first call runs fn and returns true; later calls return false.
+function createSendOnce() {
+  var sent = false;
+  return function once(fn) {
+    if (sent) return false;
+    sent = true;
+    fn();
+    return true;
+  };
+}
+
+// The answer, or null when the text is empty or over 500 characters after trim.
+function buildScanResult(ref, text, via) {
+  if (typeof ref !== 'string' || ref.length < 1 || ref.length > MAX_REF) return null;
+  if (via !== 'qr' && via !== 'typed') return null;
+  if (typeof text !== 'string') return null;
+  var clean = text.trim();
+  if (clean.length < 1 || clean.length > MAX_TEXT) return null;
+  return { v: 1, r: ref, page: 'scan', text: clean, via: via };
+}
+
+function answerBytes(result) {
+  return new TextEncoder().encode(JSON.stringify(result)).length;
+}
+
+function init() {
+  var tg = (window.Telegram && window.Telegram.WebApp) || null;
+  var $ = function (id) { return document.getElementById(id); };
+  var ref = null;
+  var prompt = pageText('en').defaultPrompt;
+  var scanned = null;
+  var sendOnce = createSendOnce();
+  var text;
+
+  function show(id, on) { $(id).hidden = !on; }
+  function setText(id, text) { $(id).textContent = text; }
+
+  function closeApp() {
+    if (!tg) { setText('errorText', text.notInTelegramClose); return; }
+    try { tg.close(); } catch (e) { setText('errorText', text.couldNotClose + ' ' + e.name); }
+  }
+
+  function send(result) {
+    setText('entryError', '');
+    setText('confirmError', '');
+    if (answerBytes(result) > MAX_ANSWER_BYTES) { setText('entryError', text.tooLong); return; }
+    if (!tg) { setText('entryError', text.notInTelegramSend); return; }
+    try {
+      tg.sendData(JSON.stringify(result));
+    } catch (e) {
+      setText('entryError', text.couldNotSend + ' ' + e.name);
+    }
+  }
+
+  function disableSend() {
+    $('btnSendTyped').disabled = true;
+    $('btnSendScanned').disabled = true;
+  }
+
+  function showEntry() {
+    show('confirm', false);
+    show('entry', true);
+  }
+
+  function showConfirm(text) {
+    setText('scanned', text);
+    show('entry', false);
+    show('confirm', true);
+  }
+
+  function startScan() {
+    setText('entryError', '');
+    setText('confirmError', '');
+    if (!scannerAvailable(tg)) {
+      setText('scanNote', text.noScanner);
+      show('scanNote', true);
+      return;
+    }
+    try {
+      tg.showScanQrPopup({ text: popupText(prompt) }, function (scanText) {
+        try {
+          var result = buildScanResult(ref, String(scanText), 'qr');
+          if (result === null) {
+            setText('entryError', text.badScan);
+            return true;
+          }
+          scanned = result.text;
+          tg.closeScanQrPopup();
+          showConfirm(scanned);
+        } catch (e) {
+          setText('entryError', text.scanFailed + ' ' + e.name);
+        }
+        return true;
+      });
+    } catch (e) {
+      setText('entryError', text.scanFailed + ' ' + e.name);
+    }
+  }
+
+  var parsed = parseFragment(location.hash);
+  var lang = parsed.ok ? readLang(parsed.data) : 'en';
+  text = pageText(lang);
+  document.documentElement.lang = lang === null ? 'en' : lang;
+  document.title = text.docTitle;
+  setText('title', text.heading);
+  setText('btnCloseError', text.close);
+  setText('btnScan', text.scanButton);
+  setText('typedLabel', text.typedLabel);
+  setText('btnSendTyped', text.sendTyped);
+  setText('scannedHeading', text.scannedHeading);
+  setText('btnSendScanned', text.sendScanned);
+  setText('btnRescan', text.rescan);
+  if (errorText(parsed) !== null) {
+    show('entry', false);
+    show('confirm', false);
+    setText('errorText', errorText(parsed));
+    show('error', true);
+    $('btnCloseError').addEventListener('click', closeApp);
+    if (tg) try { tg.ready(); } catch (e) { /* the error is already shown */ }
+    return;
+  }
+
+  ref = parsed.data.r;
+  prompt = scanPrompt(parsed.data);
+  setText('prompt', prompt);
+  show('entry', true);
+  var canScan = scannerAvailable(tg);
+  $('btnScan').hidden = !canScan;
+  if (!canScan) {
+    setText('scanNote', text.noScanner);
+    show('scanNote', true);
+  }
+
+  $('btnScan').addEventListener('click', startScan);
+  $('typedForm').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var result = buildScanResult(ref, $('typed').value, 'typed');
+    if (result === null) {
+      setText('entryError', text.enterCode);
+      return;
+    }
+    sendOnce(function () { disableSend(); send(result); });
+  });
+  $('btnSendScanned').addEventListener('click', function () {
+    var result = buildScanResult(ref, scanned, 'qr');
+    if (result === null) {
+      setText('confirmError', text.emptyScanned);
+      return;
+    }
+    sendOnce(function () { disableSend(); send(result); });
+  });
+  $('btnRescan').addEventListener('click', function () {
+    scanned = null;
+    showEntry();
+    startScan();
+  });
+
+  if (tg) try { tg.ready(); tg.expand(); } catch (e) { setText('entryError', text.readyFailed + ' ' + e.name); }
+}
+
+window.__page = {
+  parseFragment: parseFragment,
+  buildScanResult: buildScanResult,
+  scanPrompt: scanPrompt,
+  scannerAvailable: scannerAvailable,
+  popupText: popupText,
+  createSendOnce: createSendOnce,
+  pageText: pageText,
+  readLang: readLang,
+  errorText: errorText
+};
+
+if (typeof document !== 'undefined') {
+  init();
+}
+</script>
+</body>
+</html>
